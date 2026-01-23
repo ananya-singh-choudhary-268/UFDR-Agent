@@ -1,56 +1,137 @@
-import os
+"""
+Redis connection pool management.
+
+Provides async Redis connection pooling with proper
+configuration, error handling, and graceful degradation.
+"""
+
+import logging
+from typing import AsyncGenerator, Optional
+
 import redis.asyncio as redis
 from redis.asyncio.connection import ConnectionPool
-from typing import Optional, AsyncGenerator
 
-# This global variable will hold the connection pool for the application.
+logger = logging.getLogger(__name__)
+
+# Global connection pool
 redis_pool: Optional[ConnectionPool] = None
 
-async def init_redis_pool():
-    """
-    Initializes the Redis connection pool. This should be called once during application startup.
-    """
-    global redis_pool
-    if redis_pool is not None:
-        return
 
-    # Get the Redis URL from environment variables, with a sensible default.
-    redis_url = os.getenv("REDIS_URL", "redis://localhost:6380")
-    print(f"Initializing Redis connection pool for URL: {redis_url}")
-
-    try:
-        # decode_responses=True ensures that Redis returns strings, not bytes.
-        pool = redis.ConnectionPool.from_url(redis_url, decode_responses=True)
-        # Basic connectivity check to fail fast but not crash the app.
-        async with redis.Redis(connection_pool=pool) as client:
-            await client.ping()
-        redis_pool = pool
-        print("Redis connection pool initialized successfully.")
-    except Exception as exc:
-        # Keep running without Redis; downstream callers will see redis_pool is None.
-        redis_pool = None
-        print(f"[WARNING] Redis connection pool not initialized: {exc}")
-
-async def close_redis_pool():
+class RedisManager:
     """
-    Closes the Redis connection pool. This should be called once during application shutdown.
+    Manages Redis connection pool.
+    
+    Provides connection pool management with graceful degradation
+    when Redis is unavailable.
     """
-    global redis_pool
-    if redis_pool:
-        print("Closing Redis connection pool.")
+    
+    def __init__(self):
+        self._pool: Optional[ConnectionPool] = None
+    
+    @property
+    def pool(self) -> Optional[ConnectionPool]:
+        """Get the connection pool."""
+        return self._pool
+    
+    @property
+    def is_initialized(self) -> bool:
+        """Check if pool is initialized and connected."""
+        return self._pool is not None
+    
+    async def init_pool(self) -> Optional[ConnectionPool]:
+        """
+        Initialize the Redis connection pool.
+        
+        Returns:
+            ConnectionPool if successful, None if Redis is unavailable
+        """
+        global redis_pool
+        
+        if self._pool is not None:
+            logger.debug("Redis pool already initialized")
+            return self._pool
+        
+        # Import settings here to avoid circular imports
+        from config import get_settings
+        settings = get_settings()
+        
+        redis_url = settings.redis_url
+        logger.info("Initializing Redis connection pool: %s", redis_url)
+        
         try:
-            await redis_pool.disconnect()
-        except Exception as exc:
-            print(f"[WARNING] Failed closing Redis pool: {exc}")
+            # Create connection pool with decode_responses for string handling
+            pool = redis.ConnectionPool.from_url(redis_url, decode_responses=True)
+            
+            # Test connectivity
+            async with redis.Redis(connection_pool=pool) as client:
+                await client.ping()
+            
+            self._pool = pool
+            redis_pool = pool  # Update global for backwards compatibility
+            logger.info("Redis connection pool initialized successfully")
+            return self._pool
+            
+        except Exception as e:
+            # Redis is optional - log warning and continue without it
+            self._pool = None
+            redis_pool = None
+            logger.warning("Redis connection pool not initialized: %s", e)
+            return None
+    
+    async def close_pool(self) -> None:
+        """Close the Redis connection pool."""
+        global redis_pool
+        
+        if self._pool is not None:
+            logger.info("Closing Redis connection pool")
+            try:
+                await self._pool.disconnect()
+            except Exception as e:
+                logger.warning("Error closing Redis pool: %s", e)
+            finally:
+                self._pool = None
+                redis_pool = None
 
-async def get_redis_client() -> AsyncGenerator[redis.Redis, None]:
+
+# Global Redis manager instance
+_redis_manager = RedisManager()
+
+
+# =============================================================================
+# Public API (backwards compatible)
+# =============================================================================
+
+async def init_redis_pool() -> Optional[ConnectionPool]:
     """
-    FastAPI dependency injector to get a Redis client from the pool.
+    Initialize the Redis connection pool.
+    
+    This function is called during application startup.
     """
-    if not redis_pool:
-        # Yield None so callers can degrade gracefully if Redis is unavailable.
+    return await _redis_manager.init_pool()
+
+
+async def close_redis_pool() -> None:
+    """
+    Close the Redis connection pool.
+    
+    This function is called during application shutdown.
+    """
+    await _redis_manager.close_pool()
+
+
+async def get_redis_client() -> AsyncGenerator[Optional[redis.Redis], None]:
+    """
+    FastAPI dependency to get a Redis client from the pool.
+    
+    Yields None if Redis is unavailable, allowing graceful degradation.
+    
+    Yields:
+        redis.Redis client or None if unavailable
+    """
+    if _redis_manager.pool is None:
+        # Redis unavailable - yield None for graceful degradation
         yield None
         return
-
-    async with redis.Redis(connection_pool=redis_pool) as client:
+    
+    async with redis.Redis(connection_pool=_redis_manager.pool) as client:
         yield client

@@ -1,72 +1,147 @@
-import asyncpg
-import os
-from typing import Optional
+"""
+Database connection pool management.
+
+Provides async database connection pooling using asyncpg with proper
+configuration, error handling, and logging.
+"""
+
 import logging
 from contextlib import asynccontextmanager
-from dotenv import load_dotenv
+from pathlib import Path
+from typing import Optional
 
-# Load environment variables from .env file
-# Get the realtime directory (3 levels up: db -> utils -> realtime)
-realtime_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-env_path = os.path.join(realtime_dir, '.env')
-
-# Load .env file and verify it exists
-if os.path.exists(env_path):
-    load_dotenv(env_path)
-    print(f"[connection] Loaded .env from: {env_path}")
-else:
-    print(f"[connection] WARNING: .env file not found at: {env_path}")
+import asyncpg
 
 logger = logging.getLogger(__name__)
 
-# Database connection pool
-_pool: Optional[asyncpg.Pool] = None
 
-async def init_db_pool():
-    """Initialize the database connection pool"""
-    global _pool
+class DatabaseManager:
+    """
+    Manages PostgreSQL database connection pool.
+    
+    Provides thread-safe connection pool management with proper
+    initialization, health checking, and cleanup.
+    """
+    
+    def __init__(self):
+        self._pool: Optional[asyncpg.Pool] = None
+    
+    @property
+    def pool(self) -> Optional[asyncpg.Pool]:
+        """Get the connection pool."""
+        return self._pool
+    
+    @property
+    def is_initialized(self) -> bool:
+        """Check if pool is initialized."""
+        return self._pool is not None
+    
+    async def init_pool(self) -> asyncpg.Pool:
+        """
+        Initialize the database connection pool.
+        
+        Uses settings from config module for connection parameters.
+        
+        Returns:
+            asyncpg.Pool: Initialized connection pool
+            
+        Raises:
+            ValueError: If DATABASE_URL is not configured
+            ConnectionError: If database connection fails
+        """
+        if self._pool is not None:
+            logger.debug("Database pool already initialized")
+            return self._pool
+        
+        # Import settings here to avoid circular imports
+        from config import get_settings
+        settings = get_settings()
+        
+        database_url = settings.database_url
+        if not database_url:
+            raise ValueError("DATABASE_URL is not configured")
+        
+        try:
+            self._pool = await asyncpg.create_pool(
+                database_url,
+                min_size=settings.db_pool_min_size,
+                max_size=settings.db_pool_max_size,
+                command_timeout=settings.db_command_timeout
+            )
+            logger.info(
+                "Database connection pool initialized (min=%d, max=%d)",
+                settings.db_pool_min_size,
+                settings.db_pool_max_size
+            )
+            return self._pool
+            
+        except Exception as e:
+            logger.error("Failed to initialize database pool: %s", e)
+            raise ConnectionError(f"Database connection failed: {e}") from e
+    
+    async def close_pool(self) -> None:
+        """Close the database connection pool."""
+        if self._pool is not None:
+            await self._pool.close()
+            self._pool = None
+            logger.info("Database connection pool closed")
+    
+    async def get_pool(self) -> asyncpg.Pool:
+        """
+        Get the database connection pool, initializing if necessary.
+        
+        Returns:
+            asyncpg.Pool: Active connection pool
+            
+        Raises:
+            ConnectionError: If pool cannot be initialized
+        """
+        if self._pool is None:
+            await self.init_pool()
+        return self._pool
+    
+    @asynccontextmanager
+    async def connection(self):
+        """
+        Context manager to get a database connection from the pool.
+        
+        Yields:
+            asyncpg.Connection: Database connection
+            
+        Example:
+            async with db_manager.connection() as conn:
+                await conn.execute("SELECT 1")
+        """
+        pool = await self.get_pool()
+        async with pool.acquire() as connection:
+            yield connection
 
-    if _pool is not None:
-        return _pool
 
-    database_url = os.getenv("DATABASE_URL")
-    if not database_url:
-        raise ValueError("DATABASE_URL environment variable is not set")
+# Global database manager instance
+_db_manager = DatabaseManager()
 
-    try:
-        _pool = await asyncpg.create_pool(
-            database_url,
-            min_size=2,
-            max_size=10,
-            command_timeout=60
-        )
-        logger.info("Database connection pool initialized successfully")
-        return _pool
-    except Exception as e:
-        logger.error(f"Failed to initialize database pool: {str(e)}")
-        raise
 
-async def close_db_pool():
-    """Close the database connection pool"""
-    global _pool
+# =============================================================================
+# Public API (backwards compatible)
+# =============================================================================
 
-    if _pool is not None:
-        await _pool.close()
-        _pool = None
-        logger.info("Database connection pool closed")
+async def init_db_pool() -> asyncpg.Pool:
+    """Initialize the database connection pool."""
+    return await _db_manager.init_pool()
+
+
+async def close_db_pool() -> None:
+    """Close the database connection pool."""
+    await _db_manager.close_pool()
+
 
 async def get_db_pool() -> asyncpg.Pool:
-    """Get the database connection pool, initializing if necessary"""
-    global _pool
+    """Get the database connection pool."""
+    return await _db_manager.get_pool()
 
-    if _pool is None:
-        await init_db_pool()
-
-    return _pool
 
 @asynccontextmanager
 async def get_db_connection():
-    """Context manager to get a database connection from the pool"""
-    pool = await get_db_pool()
-    async with pool.acquire() as connection:
-        yield connection
+    """Context manager to get a database connection from the pool."""
+    async with _db_manager.connection() as conn:
+        yield conn
